@@ -1,3 +1,10 @@
-from .settings import settings
+"""
+Configuration settings for Second Brain Knowledge Management System
+"""
 
-__all__ = ["settings"]
+from .settings import settings, Settings
+
+__all__ = [
+    "settings",
+    "Settings"
+]
