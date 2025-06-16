@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 FastAPI main application for Second Brain Knowledge Management System
+Updated to include tag generation in recommendations
 """
 import sys
 import os
@@ -9,6 +10,7 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 import uvicorn
 
 # Add src to Python path
@@ -18,7 +20,7 @@ try:
     from core.similarity import SSC
     from core.llm_updater import LLMUpdater
     from core.embeddings import get_embedding
-    from database.manager import add_knowledge_to_database, load_knowledge_database
+    from database.supabase_manager import supabase_manager
     from utils.helpers import get_database_stats
     from config.settings import settings
 except ImportError as e:
@@ -44,15 +46,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Import Pydantic models
-from api_models import (
-    TextInput, 
-    SimilarityResponse, 
-    RecommendationsResponse, 
-    ApplyRecommendationInput,
-    CategoriesResponse,
-    HealthResponse
-)
+# Request/Response Models
+class ProcessTextRequest(BaseModel):
+    """Request model for processing text input"""
+    text: str = Field(..., min_length=1, max_length=10000, description="Text to process")
+    threshold: float = Field(0.8, ge=0.0, le=1.0, description="Similarity threshold (0.0-1.0)")
+
+class RecommendationResponse(BaseModel):
+    """Single recommendation response"""
+    option_number: int = Field(..., description="Recommendation option number (1-3)")
+    change: str = Field(..., description="Explanation of what changes will be made")
+    updated_text: str = Field(..., description="The complete updated/new text content")
+    category: str = Field(..., description="Category name for this recommendation")
+    tags: List[str] = Field(default_factory=list, description="Content-based tags for this recommendation")
+    preview: str = Field(..., description="Short preview of the content")
+
+class ProcessTextResponse(BaseModel):
+    """Response model for text processing"""
+    recommendations: List[RecommendationResponse] = Field(..., description="List of 3 recommendations")
+    similar_category: Optional[str] = Field(None, description="Most similar existing category if found")
+    similarity_score: Optional[float] = Field(None, description="Similarity score if match found")
+    status: str = Field("success", description="Request status")
+
+class CategoryResponse(BaseModel):
+    """Single knowledge category response"""
+    category: str = Field(..., description="Category name")
+    content_preview: str = Field(..., description="First 100 characters of content")
+    tags: List[str] = Field(default_factory=list, description="Category tags")
+    last_updated: Optional[str] = Field(None, description="Last update timestamp")
+
+class CategoriesResponse(BaseModel):
+    """Response model for listing categories"""
+    success: bool = Field(True, description="Request success status")
+    categories: List[CategoryResponse] = Field(..., description="List of all categories")
+    total_count: int = Field(..., description="Total number of categories")
+
+class DatabaseStatsResponse(BaseModel):
+    """Response model for database statistics"""
+    success: bool = Field(True, description="Request success status")
+    stats: Dict[str, Any] = Field(..., description="Database statistics")
+
+class HealthResponse(BaseModel):
+    """Response model for health check"""
+    status: str
+    message: str
+    version: Optional[str] = "1.0.0"
+    docs_url: Optional[str] = None
 
 @app.get("/", response_model=HealthResponse)
 async def root():
@@ -81,24 +120,71 @@ async def health_check():
             detail=f"Service unhealthy: {str(e)}"
         )
 
-@app.get("/api/categories", response_model=CategoriesResponse)
-async def get_categories(database_folder: str = "data"):
+@app.post("/api/process-text", response_model=ProcessTextResponse)
+async def process_text(request: ProcessTextRequest):
     """
-    Get all knowledge categories
+    Main endpoint: Process input text and return AI recommendations with tags
     
-    - **database_folder**: Path to the knowledge database (default: "data")
+    This endpoint:
+    1. Finds similar existing knowledge using semantic search
+    2. Generates 3 AI-powered recommendations using Azure OpenAI
+    3. Returns structured recommendations with meaningful tags
+    
+    Frontend will apply selected recommendations directly to Supabase.
     """
     try:
-        knowledge_items = load_knowledge_database(database_folder)
+        # Step 1: Check for similar existing knowledge
+        most_similar = SSC(request.text, request.threshold)
+        
+        # Step 2: Get AI recommendations from Azure OpenAI (now includes tags)
+        recommendations_raw = LLMUpdater(request.text, most_similar, "azure_openai")
+        
+        # Step 3: Format recommendations for frontend
+        formatted_recommendations = []
+        for i, rec in enumerate(recommendations_raw, 1):
+            formatted_recommendations.append(
+                RecommendationResponse(
+                    option_number=i,
+                    change=rec['change'],
+                    updated_text=rec['updated_text'],
+                    category=rec['category'],
+                    tags=rec.get('tags', []),  # Include tags from LLM response
+                    preview=rec['updated_text'][:100] + "..." if len(rec['updated_text']) > 100 else rec['updated_text']
+                )
+            )
+        
+        return ProcessTextResponse(
+            recommendations=formatted_recommendations,
+            similar_category=most_similar['category'] if most_similar else None,
+            similarity_score=most_similar['similarity_score'] if most_similar else None
+        )
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process text: {str(e)}"
+        )
+
+@app.get("/api/categories", response_model=CategoriesResponse)
+async def get_categories():
+    """
+    Get all knowledge categories from the database
+    
+    Optional endpoint - frontend can also access Supabase directly.
+    """
+    try:
+        knowledge_items = supabase_manager.load_all_knowledge()
         
         categories = []
         for item in knowledge_items:
-            categories.append({
-                "category": item['category'],
-                "content_preview": item['content'][:100] + '...' if len(item['content']) > 100 else item['content'],
-                "tags": item.get('tags', []),
-                "last_updated": item.get('last_updated', 'unknown')
-            })
+            categories.append(
+                CategoryResponse(
+                    category=item.get('category', 'Unknown'),
+                    content_preview=item.get('content', '')[:100] + "..." if len(item.get('content', '')) > 100 else item.get('content', ''),
+                    tags=item.get('tags', []),
+                    last_updated=item.get('last_updated')
+                )
+            )
         
         return CategoriesResponse(
             success=True,
@@ -112,173 +198,20 @@ async def get_categories(database_folder: str = "data"):
             detail=f"Failed to load categories: {str(e)}"
         )
 
-@app.get("/api/stats")
-async def get_stats(database_folder: str = "data"):
+@app.get("/api/stats", response_model=DatabaseStatsResponse)
+async def get_stats():
     """
     Get database statistics
     
-    - **database_folder**: Path to the knowledge database (default: "data")
+    Optional endpoint - frontend can calculate stats from Supabase directly.
     """
     try:
-        stats = get_database_stats(database_folder)
-        return {"success": True, "stats": stats}
+        stats = supabase_manager.get_database_stats()
+        return DatabaseStatsResponse(success=True, stats=stats)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get stats: {str(e)}"
-        )
-
-@app.post("/api/similarity", response_model=SimilarityResponse)
-async def check_similarity(input_data: TextInput):
-    """
-    Check semantic similarity against existing knowledge
-    
-    - **text**: The text to check for similarity
-    - **threshold**: Minimum similarity threshold (0.0 to 1.0)
-    - **database_folder**: Path to the knowledge database
-    """
-    try:
-        most_similar = SSC(
-            input_data.text, 
-            input_data.threshold, 
-            input_data.database_folder
-        )
-        
-        return SimilarityResponse(
-            success=True,
-            similar_found=most_similar is not None,
-            most_similar=most_similar,
-            threshold_used=input_data.threshold
-        )
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Similarity check failed: {str(e)}"
-        )
-
-@app.post("/api/recommendations", response_model=RecommendationsResponse)
-async def get_recommendations(input_data: TextInput):
-    """
-    Get AI-powered recommendations for processing the input text
-    
-    - **text**: The text to process
-    - **threshold**: Similarity threshold for finding existing knowledge
-    - **llm_type**: LLM to use ("openai" or "groq")
-    - **database_folder**: Path to the knowledge database
-    """
-    try:
-        # Check for similar existing knowledge
-        most_similar = SSC(
-            input_data.text, 
-            input_data.threshold, 
-            input_data.database_folder
-        )
-        
-        # Get recommendations from LLM
-        recommendations_raw = LLMUpdater(
-            input_data.text, 
-            most_similar, 
-            input_data.llm_type
-        )
-        
-        return RecommendationsResponse(
-            success=True,
-            input_text=input_data.text,
-            threshold_used=input_data.threshold,
-            llm_type_used=input_data.llm_type,
-            similar_found=most_similar is not None,
-            most_similar=most_similar,
-            recommendations=recommendations_raw
-        )
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get recommendations: {str(e)}"
-        )
-
-@app.post("/api/apply-recommendation")
-async def apply_recommendation(input_data: ApplyRecommendationInput):
-    """
-    Apply a selected recommendation to the knowledge database
-    
-    - **category**: Category name for the knowledge
-    - **content**: The content to store
-    - **change**: Description of what changed
-    - **tags**: Tags to associate with this knowledge
-    - **database_folder**: Path to the knowledge database
-    """
-    try:
-        # Create knowledge item
-        knowledge_item = {
-            'category': input_data.category,
-            'content': input_data.content,
-            'tags': input_data.tags,
-            'embedding': get_embedding(input_data.content),
-            'last_updated': 'now'
-        }
-        
-        # Add to database
-        add_knowledge_to_database(
-            knowledge_item, 
-            f"{input_data.database_folder}/knowledge"
-        )
-        
-        return {
-            "success": True,
-            "message": f"Successfully applied recommendation to category: {input_data.category}",
-            "category": input_data.category,
-            "change": input_data.change
-        }
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to apply recommendation: {str(e)}"
-        )
-
-@app.post("/api/process-full", response_model=RecommendationsResponse)
-async def process_full(input_data: TextInput):
-    """
-    Complete processing pipeline: similarity check + AI recommendations
-    
-    This is the main endpoint that combines similarity checking and recommendation generation.
-    
-    - **text**: The text to process
-    - **threshold**: Similarity threshold for finding existing knowledge  
-    - **llm_type**: LLM to use ("openai" or "groq")
-    - **database_folder**: Path to the knowledge database
-    """
-    try:
-        # Step 1: Check similarity
-        most_similar = SSC(
-            input_data.text, 
-            input_data.threshold, 
-            input_data.database_folder
-        )
-        
-        # Step 2: Get recommendations
-        recommendations = LLMUpdater(
-            input_data.text, 
-            most_similar, 
-            input_data.llm_type
-        )
-        
-        return RecommendationsResponse(
-            success=True,
-            input_text=input_data.text,
-            threshold_used=input_data.threshold,
-            llm_type_used=input_data.llm_type,
-            similar_found=most_similar is not None,
-            most_similar=most_similar,
-            recommendations=recommendations
-        )
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Full processing failed: {str(e)}"
         )
 
 # Global exception handler
@@ -300,11 +233,8 @@ async def startup_event():
         settings.validate()
         print("✅ Settings validated")
         
-        # Create data directory if it doesn't exist
-        os.makedirs('data/knowledge', exist_ok=True)
-        print("✅ Data directory ready")
-        
         print("✅ Second Brain API started successfully!")
+        print("📚 Now includes intelligent tag generation!")
         
     except ValueError as e:
         print(f"❌ Configuration error: {e}")
@@ -318,6 +248,7 @@ if __name__ == "__main__":
     print(f"🌟 Starting Second Brain API on port {port}")
     print(f"📚 API docs available at: http://localhost:{port}/docs")
     print(f"📖 Alternative docs at: http://localhost:{port}/redoc")
+    print(f"🏷️ Now with intelligent tag generation!")
     
     uvicorn.run(
         "main:app",
