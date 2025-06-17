@@ -37,10 +37,13 @@ app = FastAPI(
     redoc_url="/redoc"  # ReDoc at /redoc
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your frontend domain
+    allow_origins=[
+        "http://localhost:3000", 
+        "https://your-frontend-domain.vercel.app",  # Add your actual frontend URL
+        "*"  # Remove this in production for security
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -242,18 +245,19 @@ async def startup_event():
         raise
 
 if __name__ == "__main__":
-    # For local development
+    import uvicorn
+    
+    # Railway provides PORT environment variable
     port = int(os.environ.get('PORT', 8000))
     
     print(f"🌟 Starting Second Brain API on port {port}")
     print(f"📚 API docs available at: http://localhost:{port}/docs")
     print(f"📖 Alternative docs at: http://localhost:{port}/redoc")
-    print(f"🏷️ Now with intelligent tag generation!")
     
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=port,
-        reload=True,  # Auto-reload on code changes
+        reload=False,  # Set to False for production
         log_level="info"
     )
